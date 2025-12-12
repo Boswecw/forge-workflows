@@ -1,0 +1,212 @@
+name: Tauri CI (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # Rust/Build Configuration
+      rust_target_windows:
+        type: string
+        default: x86_64-pc-windows-msvc
+        description: Rust target triple for Windows builds
+      
+      tauri_workdir:
+        type: string
+        default: src-tauri
+        description: Directory containing Cargo.toml for Tauri app
+      
+      frontend_dir:
+        type: string
+        default: .
+        description: Directory for frontend source (SvelteKit, etc.)
+      
+      frontend_build_dir:
+        type: string
+        default: dist
+        description: Output directory of frontend build (dist or build)
+      
+      # Feature Flags
+      build_frontend:
+        type: boolean
+        default: false
+        description: Run frontend build (pnpm build) before Tauri checks
+      
+      run_tauri_build:
+        type: boolean
+        default: false
+        description: Build final Tauri app bundles (slowâ€”usually only for releases)
+      
+      # CI Behavior
+      continue_on_test_failure:
+        type: boolean
+        default: false
+        description: Continue workflow even if tests fail (for debugging)
+      
+      # Environment
+      rust_version:
+        type: string
+        default: stable
+        description: Rust toolchain version (stable, nightly, 1.70.0, etc.)
+
+concurrency:
+  group: tauri-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quick-checks:
+    name: Tauri CI (${{ matrix.os }})
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            build_target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            build_target: ${{ inputs.rust_target_windows }}
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      # ========== Checkout & Setup ==========
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ========== Linux Dependencies ==========
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libglib2.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            build-essential \
+            libssl-dev
+
+      # ========== Frontend Setup (if enabled) ==========
+      - name: Setup Node.js
+        if: inputs.build_frontend
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        if: inputs.build_frontend
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Cache pnpm dependencies
+        if: inputs.build_frontend
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install frontend dependencies
+        if: inputs.build_frontend
+        working-directory: ${{ inputs.frontend_dir }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        if: inputs.build_frontend
+        working-directory: ${{ inputs.frontend_dir }}
+        run: pnpm build
+
+      # ========== Frontend Placeholder (if not building) ==========
+      - name: Create frontend placeholder (Linux)
+        if: |
+          !inputs.build_frontend && runner.os == 'Linux'
+        run: |
+          mkdir -p "${{ inputs.frontend_dir }}/${{ inputs.frontend_build_dir }}"
+          echo "<!doctype html><html><body>CI placeholder</body></html>" > \
+            "${{ inputs.frontend_dir }}/${{ inputs.frontend_build_dir }}/index.html"
+
+      - name: Create frontend placeholder (Windows)
+        if: |
+          !inputs.build_frontend && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $buildDir = "${{ inputs.frontend_dir }}/${{ inputs.frontend_build_dir }}"
+          New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+          Set-Content -Path "$buildDir/index.html" -Value "<!doctype html><html><body>CI placeholder</body></html>"
+
+      # ========== Rust Setup ==========
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_version }}
+          targets: ${{ matrix.build_target }}
+
+      - name: Cache Rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ inputs.tauri_workdir }}/target
+          key: ${{ runner.os }}-rust-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-
+
+      # ========== Rust Code Quality ==========
+      - name: Check formatting (cargo fmt)
+        working-directory: ${{ inputs.tauri_workdir }}
+        run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        working-directory: ${{ inputs.tauri_workdir }}
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # ========== Rust Tests ==========
+      - name: Run unit tests
+        working-directory: ${{ inputs.tauri_workdir }}
+        run: cargo test --lib --color=always
+        continue-on-error: ${{ inputs.continue_on_test_failure }}
+
+      # ========== Optional: Build Bundles ==========
+      - name: Build Tauri bundles
+        if: inputs.run_tauri_build
+        working-directory: ${{ inputs.tauri_workdir }}
+        run: cargo tauri build
+
+      - name: Upload artifacts (Windows)
+        if: |
+          inputs.run_tauri_build && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-build-windows-${{ github.run_number }}
+          path: |
+            ${{ inputs.tauri_workdir }}/target/release/bundle/msi/
+            ${{ inputs.tauri_workdir }}/target/release/bundle/nsis/
+          retention-days: 30
+
+      - name: Upload artifacts (Linux)
+        if: |
+          inputs.run_tauri_build && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-build-linux-${{ github.run_number }}
+          path: |
+            ${{ inputs.tauri_workdir }}/target/release/bundle/deb/
+            ${{ inputs.tauri_workdir }}/target/release/bundle/appimage/
+          retention-days: 30
+
+  # ========== Summary Job ==========
+  ci-result:
+    name: CI Status
+    runs-on: ubuntu-latest
+    needs: quick-checks
+    if: always()
+    steps:
+      - name: Check status
+        run: |
+          if [ "${{ needs.quick-checks.result }}" == "failure" ]; then
+            echo "âŒ CI failed"
+            exit 1
+          else
+            echo "âœ… CI passed"
+          fi
