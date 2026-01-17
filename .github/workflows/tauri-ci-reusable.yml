@@ -33,7 +33,7 @@ on:
       run_tauri_build:
         type: boolean
         default: false
-        description: Build final Tauri app bundles (slowâ€”usually only for releases)
+        description: Build final Tauri app bundles (slow - usually only for releases)
       
       # CI Behavior
       continue_on_test_failure:
@@ -205,8 +205,8 @@ jobs:
       - name: Check status
         run: |
           if [ "${{ needs.quick-checks.result }}" == "failure" ]; then
-            echo "âŒ CI failed"
+            echo "CI failed"
             exit 1
           else
-            echo "âœ… CI passed"
+            echo "CI passed"
           fi
